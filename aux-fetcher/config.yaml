@@ -1,5 +1,5 @@
 name: Aux Fetcher
-version: "1.4.0"
+version: "1.5.0"
 slug: aux_fetcher
 description: Downloads songs for your Aux Discord bot through your home internet, keeps a copy of every song on this box, and backs up the Aux database nightly. Outbound only, no open ports.
 url: https://github.com/riodle48/aux-fetcher
@@ -17,10 +17,12 @@ options:
   key: ""
   store_dir: "/share/aux"
   backup_days: 14
+  max_store_gb: 160
   spotify_cookies: ""
 schema:
   server_url: url
   key: password
   store_dir: str
   backup_days: int(1,365)
+  max_store_gb: int(5,4000)
   spotify_cookies: str?

@@ -7,7 +7,7 @@ Outbound HTTPS only. Nothing listens. Nothing touches Home Assistant.
 """
 import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.parse, urllib.error, hashlib, shutil, glob, threading, re
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 def load_options():
     opts = {}
@@ -20,20 +20,41 @@ def load_options():
     key = os.environ.get("AUX_KEY") or opts.get("key") or ""
     store = os.environ.get("AUX_STORE") or opts.get("store_dir") or "/share/aux"
     keep_days = int(os.environ.get("AUX_BACKUP_DAYS") or opts.get("backup_days") or 14)
-    return server, key, store, keep_days
+    max_gb = float(os.environ.get("AUX_MAX_STORE_GB") or opts.get("max_store_gb") or 160)
+    return server, key, store, keep_days, max_gb
 
-SERVER, KEY, STORE, BACKUP_DAYS = load_options()
+SERVER, KEY, STORE, BACKUP_DAYS, MAX_STORE_GB = load_options()
+MAX_STORE_BYTES = int(MAX_STORE_GB * 1024 ** 3)
 # Song store (every download is kept here forever = instant replays even after the cloud cache forgets) + nightly DB backups.
 CACHE_DIR = os.path.join(STORE, "songs"); BACKUP_DIR = os.path.join(STORE, "backups")
 for d in (CACHE_DIR, BACKUP_DIR):
     try: os.makedirs(d, exist_ok=True)
     except Exception as e: print(f"can't create {d}: {e}", flush=True)
 def cache_path(url): return os.path.join(CACHE_DIR, hashlib.sha1(url.encode()).hexdigest() + ".audio")
-def store_stats():
+_stats_cache = (0, 0, 0)   # (at, count, bytes) · walking 30k files every poll is pointless
+def store_stats(fresh=False):
+    global _stats_cache
+    if not fresh and time.time() - _stats_cache[0] < 120: return _stats_cache[1], _stats_cache[2]
     try:
         files = glob.glob(os.path.join(CACHE_DIR, "*.audio"))
-        return len(files), sum(os.path.getsize(f) for f in files)
-    except Exception: return 0, 0
+        n, b = len(files), sum(os.path.getsize(f) for f in files)
+    except Exception: n, b = 0, 0
+    _stats_cache = (time.time(), n, b)
+    return n, b
+_evict_lock = threading.Lock()
+def make_room(incoming):
+    """Keep the store under max_store_gb: drop the least-recently-played songs (mtime = last play/keep) until the new one fits."""
+    with _evict_lock:
+        n, b = store_stats(fresh=True)
+        if b + incoming <= MAX_STORE_BYTES: return
+        files = sorted(glob.glob(os.path.join(CACHE_DIR, "*.audio")), key=lambda f: os.path.getmtime(f))
+        freed = 0
+        for f in files:
+            if b + incoming - freed <= MAX_STORE_BYTES: break
+            try: sz = os.path.getsize(f); os.remove(f); freed += sz
+            except Exception: pass
+        store_stats(fresh=True)
+        print(f"store at the {MAX_STORE_GB:g} GB cap → dropped the least-played songs ({freed//1048576} MB) to make room", flush=True)
 if not SERVER or not KEY:
     print("Set server_url and key in the add-on options (or AUX_SERVER / AUX_KEY).", flush=True)
     sys.exit(1)
@@ -76,7 +97,7 @@ def do_download(job):
         p = ytdlp(["-f", "bestaudio[acodec=opus]/bestaudio/best", "--quiet", "--no-part", "-o", out, url], timeout=180)
         if p.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 50_000:
             raise RuntimeError((p.stderr or "yt-dlp failed").strip().splitlines()[-1][:300])
-        try: shutil.copyfile(out, kept)
+        try: make_room(os.path.getsize(out)); shutil.copyfile(out, kept)
         except Exception as e:
             print(f"couldn't keep a copy on the Pi: {e}", flush=True)
             if keep_only: raise
@@ -89,6 +110,28 @@ def do_download(job):
     req("PUT", f"/fetch/jobs/{job['id']}?url={urllib.parse.quote(url, safe='')}", data=data,
         headers={"Content-Type": "application/octet-stream"}, timeout=180)
     print(f"✓ downloaded {url} ({len(data)//1024} KB) and kept it", flush=True)
+
+SWEEP_DAYS = 30
+def do_sweep():
+    """Once a day: drop songs nobody has played in 30 days (mtime = last play / last library warm, so songs in someone's
+    library stay). Skipped when Aux itself has been quiet — a month of silence shouldn't wipe the store."""
+    try:
+        now = time.time()
+        files = [(f, os.path.getmtime(f)) for f in glob.glob(os.path.join(CACHE_DIR, "*.audio"))]
+        if not files: return
+        recent = [f for f, m in files if now - m < SWEEP_DAYS * 86400]
+        newest = max(m for _, m in files)
+        if len(recent) < 30 or now - newest > 3 * 86400:
+            print(f"sweep skipped: Aux hasn't been used much lately ({len(recent)} songs touched in {SWEEP_DAYS} days)", flush=True); return
+        old = [(f, os.path.getsize(f)) for f, m in files if now - m >= SWEEP_DAYS * 86400]
+        freed = 0
+        for f, sz in old:
+            try: os.remove(f); freed += sz
+            except Exception: pass
+        store_stats(fresh=True)
+        if old: print(f"✓ sweep: dropped {len(old)} songs nobody played in {SWEEP_DAYS} days ({freed//1048576} MB freed)", flush=True)
+    except Exception as e:
+        print(f"sweep failed: {e}", flush=True)
 
 def do_backup():
     """Pull a consistent copy of the Aux database and keep BACKUP_DAYS days of them."""
@@ -274,7 +317,7 @@ def self_update():
         pass
 
 n0, b0 = store_stats()
-print(f"Aux Fetcher {VERSION} → {SERVER} (host {HOST}) · store {STORE}: {n0} songs, {b0//1048576} MB", flush=True)
+print(f"Aux Fetcher {VERSION} → {SERVER} (host {HOST}) · store {STORE}: {n0} songs, {b0//1048576} MB (cap {MAX_STORE_GB:g} GB)", flush=True)
 last_update = time.time()
 last_backup = 0  # first backup right after boot, then daily
 backoff = 2
@@ -303,7 +346,7 @@ while True:
     try:
         active.acquire()           # wait for a free worker slot before asking for more work
         try:
-            job = req("GET", f"/fetch/jobs?wait=25&v={VERSION}&host={urllib.parse.quote(HOST)}&songs={store_stats()[0]}", timeout=40)
+            job = req("GET", f"/fetch/jobs?wait=25&v={VERSION}&host={urllib.parse.quote(HOST)}&songs={store_stats()[0]}&bytes={store_stats()[1]}&cap_gb={MAX_STORE_GB:g}", timeout=40)
         except Exception:
             active.release(); raise
         backoff = 2
@@ -325,3 +368,4 @@ while True:
         self_update(); last_update = time.time()
     if time.time() - last_backup > 86400:
         last_backup = time.time() if do_backup() else time.time() - 86400 + 3600
+        do_sweep()
