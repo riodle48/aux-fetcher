@@ -7,7 +7,7 @@ Outbound HTTPS only. Nothing listens. Nothing touches Home Assistant.
 """
 import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.parse, urllib.error, hashlib, shutil, glob
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 def load_options():
     opts = {}
@@ -87,7 +87,9 @@ def do_backup():
         n, b = store_stats()
         print(f"✓ database backed up to {dest} ({os.path.getsize(dest)//1024} KB) · Pi store: {n} songs, {b//1048576} MB", flush=True)
     except Exception as e:
-        print(f"backup failed: {e}", flush=True)
+        print(f"backup failed: {e} (will retry in an hour)", flush=True)
+        return False
+    return True
 
 def do_search(job):
     q, n = job["query"], int(job.get("count") or 6)
@@ -156,4 +158,4 @@ while True:
     if time.time() - last_update > 86400:
         self_update(); last_update = time.time()
     if time.time() - last_backup > 86400:
-        last_backup = time.time(); do_backup()
+        last_backup = time.time() if do_backup() else time.time() - 86400 + 3600
