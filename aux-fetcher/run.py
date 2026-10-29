@@ -7,7 +7,7 @@ Outbound HTTPS only. Nothing listens. Nothing touches Home Assistant.
 """
 import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.parse, urllib.error, hashlib, shutil, glob, threading, re
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 def load_options():
     opts = {}
@@ -132,6 +132,23 @@ def do_sweep():
         if old: print(f"✓ sweep: dropped {len(old)} songs nobody played in {SWEEP_DAYS} days ({freed//1048576} MB freed)", flush=True)
     except Exception as e:
         print(f"sweep failed: {e}", flush=True)
+
+def do_backups_list(job):
+    """Admin page: which nightly backups are here."""
+    rows = []
+    for f in sorted(glob.glob(os.path.join(BACKUP_DIR, "aux-*.sqlite")), reverse=True):
+        rows.append({"name": os.path.basename(f), "bytes": os.path.getsize(f), "at": int(os.path.getmtime(f) * 1000)})
+    post_result(job, {"backups": rows})
+
+def do_restore(job):
+    """Admin pressed Restore: upload that backup to the server (it checks it and restarts to swap it in)."""
+    name = os.path.basename(str(job.get("name") or ""))
+    path = os.path.join(BACKUP_DIR, name)
+    if not name.startswith("aux-") or not name.endswith(".sqlite") or not os.path.exists(path):
+        raise RuntimeError(f"no backup called {name} on the Pi")
+    with open(path, "rb") as f: data = f.read()
+    req("PUT", f"/fetch/restore/{job['id']}", data=data, headers={"Content-Type": "application/octet-stream"}, timeout=300)
+    print(f"✓ uploaded backup {name} ({len(data)//1024} KB) for restore", flush=True)
 
 def do_backup():
     """Pull a consistent copy of the Aux database and keep BACKUP_DAYS days of them."""
@@ -335,6 +352,10 @@ def run_job(job):
                 do_fetch(job)
             elif job.get("kind") == "spotify_allowlist":
                 do_spotify_allowlist(job)
+            elif job.get("kind") == "backups":
+                do_backups_list(job)
+            elif job.get("kind") == "restore":
+                do_restore(job)
             else:
                 fail(job, f"unknown job kind {job.get('kind')}")
         except Exception as e:
