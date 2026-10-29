@@ -1,0 +1,18 @@
+name: Aux Fetcher
+version: "1.0.0"
+slug: aux_fetcher
+description: Downloads songs for your Aux Discord bot through your home internet, so YouTube never asks the bot to "sign in". Outbound only — no open ports.
+url: https://github.com/riodle48/aux-fetcher
+arch:
+  - aarch64
+  - amd64
+  - armv7
+startup: application
+boot: auto
+init: false
+options:
+  server_url: "https://getaux.xyz"
+  key: ""
+schema:
+  server_url: url
+  key: password
