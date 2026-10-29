@@ -7,7 +7,7 @@ Outbound HTTPS only. Nothing listens. Nothing touches Home Assistant.
 """
 import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.parse, urllib.error, hashlib, shutil, glob, threading, re
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 
 def load_options():
     opts = {}
@@ -245,6 +245,15 @@ def spotify_cookie_jar():
         out.append(c)
     return out
 
+def have_spotify_cookies():
+    """Cheap check for the poll: are the owner's dashboard cookies on this box at all?"""
+    try:
+        if os.path.getsize(os.path.join(STORE, "spotify-cookies.txt")) > 50: return True
+    except Exception: pass
+    try:
+        with open("/data/options.json") as f: return len((json.load(f).get("spotify_cookies") or "").strip()) > 50
+    except Exception: return False
+
 def do_spotify_allowlist(job):
     """Open the Spotify developer dashboard as the owner and add one person to the app's User Management list."""
     from playwright.sync_api import sync_playwright
@@ -367,7 +376,7 @@ while True:
     try:
         active.acquire()           # wait for a free worker slot before asking for more work
         try:
-            job = req("GET", f"/fetch/jobs?wait=25&v={VERSION}&host={urllib.parse.quote(HOST)}&songs={store_stats()[0]}&bytes={store_stats()[1]}&cap_gb={MAX_STORE_GB:g}", timeout=40)
+            job = req("GET", f"/fetch/jobs?wait=25&v={VERSION}&host={urllib.parse.quote(HOST)}&songs={store_stats()[0]}&bytes={store_stats()[1]}&cap_gb={MAX_STORE_GB:g}&sc={1 if have_spotify_cookies() else 0}", timeout=40)
         except Exception:
             active.release(); raise
         backoff = 2
