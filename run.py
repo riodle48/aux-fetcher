@@ -7,7 +7,7 @@ Outbound HTTPS only. Nothing listens. Nothing touches Home Assistant.
 """
 import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.parse, urllib.error, hashlib, shutil, glob, threading, re
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 def load_options():
     opts = {}
@@ -147,6 +147,19 @@ def search_fast(q, n):
     if not rows: raise RuntimeError("innertube returned no videos")
     return rows
 
+def do_fetch(job):
+    """Plain GET from the house (lyrics sites etc. that block datacenter IPs). Returns status + body text (capped)."""
+    url = job["url"]
+    r = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": job.get("accept") or "*/*", "Accept-Language": "en-US,en;q=0.9"})
+    try:
+        with urllib.request.urlopen(r, timeout=12) as resp:
+            body = resp.read(900_000).decode("utf-8", "replace")
+            post_result(job, {"status": resp.status, "body": body})
+            print(f"✓ fetch {url[:80]} → {resp.status} ({len(body)//1024} KB)", flush=True)
+    except urllib.error.HTTPError as e:
+        post_result(job, {"status": e.code, "body": ""})
+        print(f"✓ fetch {url[:80]} → HTTP {e.code}", flush=True)
+
 def do_search(job):
     q, n = job["query"], int(job.get("count") or 6)
     try:
@@ -204,6 +217,8 @@ def run_job(job):
                 do_download(job)
             elif job.get("kind") == "search":
                 do_search(job)
+            elif job.get("kind") == "fetch":
+                do_fetch(job)
             else:
                 fail(job, f"unknown job kind {job.get('kind')}")
         except Exception as e:
