@@ -7,7 +7,7 @@ Outbound HTTPS only. Nothing listens. Nothing touches Home Assistant.
 """
 import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.parse, urllib.error, hashlib, shutil, glob, threading, re
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 def load_options():
     opts = {}
@@ -160,6 +160,77 @@ def do_fetch(job):
         post_result(job, {"status": e.code, "body": ""})
         print(f"✓ fetch {url[:80]} → HTTP {e.code}", flush=True)
 
+# ---------------------------------------------------------------- Spotify dashboard (allow-list)
+def spotify_cookie_jar():
+    """Netscape cookies.txt → Playwright cookies. From /share/aux/spotify-cookies.txt, or the add-on option."""
+    path = os.path.join(STORE, "spotify-cookies.txt")
+    text = ""
+    if os.path.exists(path):
+        with open(path) as f: text = f.read()
+    else:
+        try:
+            with open("/data/options.json") as f: text = (json.load(f).get("spotify_cookies") or "")
+        except Exception: text = ""
+    out = []
+    for line in text.replace("\\n", "\n").splitlines():
+        if not line.strip() or line.startswith("#"): continue
+        f = line.split("\t")
+        if len(f) < 7: continue
+        domain, _flag, cpath, secure, expires, name, value = f[:7]
+        if "spotify.com" not in domain: continue
+        c = {"name": name, "value": value.strip(), "domain": domain, "path": cpath or "/", "secure": secure.upper() == "TRUE", "httpOnly": False}
+        try:
+            if int(float(expires)) > 0: c["expires"] = int(float(expires))
+        except Exception: pass
+        out.append(c)
+    return out
+
+def do_spotify_allowlist(job):
+    """Open the Spotify developer dashboard as the owner and add one person to the app's User Management list."""
+    from playwright.sync_api import sync_playwright
+    client_id, name, email = job["client_id"], (job.get("name") or "Aux user")[:60], job["email"].strip()
+    cookies = spotify_cookie_jar()
+    if not cookies:
+        raise RuntimeError("no Spotify cookies on the Pi yet (put cookies.txt at /share/aux/spotify-cookies.txt or in the add-on option)")
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(executable_path=os.environ.get("AUX_CHROMIUM") or None, headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        ctx = browser.new_context(user_agent=UA, viewport={"width": 1280, "height": 900})
+        ctx.add_cookies(cookies)
+        page = ctx.new_page()
+        try:
+            page.goto(f"https://developer.spotify.com/dashboard/{client_id}/users", wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(2500)
+            if "accounts.spotify.com" in page.url or page.locator("text=Log in").count() and page.locator("#email").count() == 0:
+                raise RuntimeError("Spotify dashboard login expired · the owner needs to paste fresh cookies")
+            # cookie banner, if it shows up, would eat the click
+            for sel in ["#onetrust-accept-btn-handler", "button:has-text('Confirm My Choices')"]:
+                try:
+                    if page.locator(sel).count(): page.locator(sel).first.click(timeout=2000)
+                except Exception: pass
+            page.wait_for_selector("#email", timeout=20000)
+            if page.locator(f"text={email}").count():
+                post_result(job, {"added": True, "already": True}); print(f"✓ {email} already on the Spotify allow-list", flush=True); return
+            page.fill("#name", name)
+            page.fill("#email", email)
+            page.get_by_role("button", name="Add user").click(timeout=10000)
+            # success = the email shows up in the table
+            ok = False
+            for _ in range(20):
+                page.wait_for_timeout(500)
+                if page.locator(f"text={email}").count(): ok = True; break
+            if not ok:
+                err = ""
+                for sel in ["[role=alert]", ".error", "text=/already|invalid|limit|maximum/i"]:
+                    try:
+                        if page.locator(sel).count(): err = page.locator(sel).first.inner_text()[:200]; break
+                    except Exception: pass
+                raise RuntimeError(f"dashboard didn't confirm the add{(': ' + err) if err else ''}")
+            post_result(job, {"added": True})
+            print(f"✓ added {email} to the Spotify allow-list", flush=True)
+        finally:
+            try: browser.close()
+            except Exception: pass
+
 def do_search(job):
     q, n = job["query"], int(job.get("count") or 6)
     try:
@@ -219,6 +290,8 @@ def run_job(job):
                 do_search(job)
             elif job.get("kind") == "fetch":
                 do_fetch(job)
+            elif job.get("kind") == "spotify_allowlist":
+                do_spotify_allowlist(job)
             else:
                 fail(job, f"unknown job kind {job.get('kind')}")
         except Exception as e:
