@@ -5,9 +5,9 @@ It asks the Aux server for jobs ("download this YouTube page" / "search for this
 from your residential IP (YouTube doesn't bot-check those), and posts the result back.
 Outbound HTTPS only. Nothing listens. Nothing touches Home Assistant.
 """
-import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.parse, urllib.error, hashlib, shutil, glob
+import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.parse, urllib.error, hashlib, shutil, glob, threading, re
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 def load_options():
     opts = {}
@@ -107,8 +107,55 @@ def do_backup():
         return False
     return True
 
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+def parse_len(s):
+    """'3:45' → 225, '1:02:03' → 3723."""
+    try:
+        parts = [int(x) for x in str(s or "").split(":")]
+        out = 0
+        for x in parts: out = out * 60 + x
+        return out or None
+    except Exception:
+        return None
+
+def search_fast(q, n):
+    """YouTube's own search endpoint (what the website calls) · ~0.3s instead of a 3-5s yt-dlp run."""
+    body = json.dumps({"context": {"client": {"clientName": "WEB", "clientVersion": "2.20250101.00.00", "hl": "en", "gl": "US"}},
+                       "query": q, "params": "EgIQAQ%3D%3D"}).encode()
+    r = urllib.request.Request("https://www.youtube.com/youtubei/v1/search?prettyPrint=false", data=body, method="POST",
+                               headers={"Content-Type": "application/json", "User-Agent": UA, "Accept-Language": "en-US,en;q=0.9",
+                                        "X-YouTube-Client-Name": "1", "X-YouTube-Client-Version": "2.20250101.00.00", "Origin": "https://www.youtube.com"})
+    with urllib.request.urlopen(r, timeout=8) as resp:
+        j = json.load(resp)
+    rows = []
+    def walk(o):
+        if len(rows) >= n: return
+        if isinstance(o, dict):
+            v = o.get("videoRenderer")
+            if v and v.get("videoId"):
+                owner = ((v.get("ownerText") or {}).get("runs") or [{}])[0].get("text", "")
+                views = re.sub(r"\D", "", ((v.get("viewCountText") or {}).get("simpleText") or ""))
+                rows.append({"id": v["videoId"], "title": "".join(x.get("text", "") for x in (v.get("title") or {}).get("runs") or []),
+                             "duration": parse_len((v.get("lengthText") or {}).get("simpleText")), "channel": owner, "uploader": owner,
+                             "view_count": int(views) if views else 0})
+                return
+            for val in o.values(): walk(val)
+        elif isinstance(o, list):
+            for val in o: walk(val)
+    walk(j)
+    if not rows: raise RuntimeError("innertube returned no videos")
+    return rows
+
 def do_search(job):
     q, n = job["query"], int(job.get("count") or 6)
+    try:
+        rows = search_fast(q, n)
+        post_result(job, {"rows": rows})
+        print(f"✓ search '{q}' → {len(rows)} results (fast)", flush=True)
+        return
+    except Exception as e:
+        print(f"fast search failed ({e}); using yt-dlp", flush=True)
     p = ytdlp(["--dump-json", "--flat-playlist", f"ytsearch{n}:{q}"], timeout=60)
     rows = []
     for line in p.stdout.splitlines():
@@ -147,20 +194,35 @@ print(f"Aux Fetcher {VERSION} → {SERVER} (host {HOST}) · store {STORE}: {n0} 
 last_update = time.time()
 last_backup = 0  # first backup right after boot, then daily
 backoff = 2
+MAX_JOBS = 3          # a play request never waits behind a library pre-download
+active = threading.Semaphore(MAX_JOBS)
+
+def run_job(job):
+    try:
+        try:
+            if job.get("kind") == "download":
+                do_download(job)
+            elif job.get("kind") == "search":
+                do_search(job)
+            else:
+                fail(job, f"unknown job kind {job.get('kind')}")
+        except Exception as e:
+            fail(job, str(e))
+    finally:
+        active.release()
+
 while True:
     try:
-        job = req("GET", f"/fetch/jobs?wait=25&v={VERSION}&host={urllib.parse.quote(HOST)}&songs={store_stats()[0]}", timeout=40)
+        active.acquire()           # wait for a free worker slot before asking for more work
+        try:
+            job = req("GET", f"/fetch/jobs?wait=25&v={VERSION}&host={urllib.parse.quote(HOST)}&songs={store_stats()[0]}", timeout=40)
+        except Exception:
+            active.release(); raise
         backoff = 2
         if job and job.get("id"):
-            try:
-                if job.get("kind") == "download":
-                    do_download(job)
-                elif job.get("kind") == "search":
-                    do_search(job)
-                else:
-                    fail(job, f"unknown job kind {job.get('kind')}")
-            except Exception as e:
-                fail(job, str(e))
+            threading.Thread(target=run_job, args=(job,), daemon=True).start()
+        else:
+            active.release()
     except urllib.error.HTTPError as e:
         if e.code == 401:
             print("Server rejected the key — check the add-on options.", flush=True); time.sleep(30)
