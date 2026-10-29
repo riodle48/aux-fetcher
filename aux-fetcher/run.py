@@ -5,9 +5,9 @@ It asks the Aux server for jobs ("download this YouTube page" / "search for this
 from your residential IP (YouTube doesn't bot-check those), and posts the result back.
 Outbound HTTPS only. Nothing listens. Nothing touches Home Assistant.
 """
-import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.parse, urllib.error
+import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.parse, urllib.error, hashlib, shutil, glob
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 def load_options():
     opts = {}
@@ -18,9 +18,22 @@ def load_options():
         pass
     server = (os.environ.get("AUX_SERVER") or opts.get("server_url") or "").rstrip("/")
     key = os.environ.get("AUX_KEY") or opts.get("key") or ""
-    return server, key
+    store = os.environ.get("AUX_STORE") or opts.get("store_dir") or "/share/aux"
+    keep_days = int(os.environ.get("AUX_BACKUP_DAYS") or opts.get("backup_days") or 14)
+    return server, key, store, keep_days
 
-SERVER, KEY = load_options()
+SERVER, KEY, STORE, BACKUP_DAYS = load_options()
+# Song store (every download is kept here forever = instant replays even after the cloud cache forgets) + nightly DB backups.
+CACHE_DIR = os.path.join(STORE, "songs"); BACKUP_DIR = os.path.join(STORE, "backups")
+for d in (CACHE_DIR, BACKUP_DIR):
+    try: os.makedirs(d, exist_ok=True)
+    except Exception as e: print(f"can't create {d}: {e}", flush=True)
+def cache_path(url): return os.path.join(CACHE_DIR, hashlib.sha1(url.encode()).hexdigest() + ".audio")
+def store_stats():
+    try:
+        files = glob.glob(os.path.join(CACHE_DIR, "*.audio"))
+        return len(files), sum(os.path.getsize(f) for f in files)
+    except Exception: return 0, 0
 if not SERVER or not KEY:
     print("Set server_url and key in the add-on options (or AUX_SERVER / AUX_KEY).", flush=True)
     sys.exit(1)
@@ -40,6 +53,14 @@ def ytdlp(args, timeout):
 
 def do_download(job):
     url = job["url"]
+    kept = cache_path(url)
+    if os.path.exists(kept) and os.path.getsize(kept) > 50_000:
+        with open(kept, "rb") as f: data = f.read()
+        req("PUT", f"/fetch/jobs/{job['id']}?url={urllib.parse.quote(url, safe='')}", data=data,
+            headers={"Content-Type": "application/octet-stream"}, timeout=180)
+        os.utime(kept, None)
+        print(f"✓ served from Pi store {url} ({len(data)//1024} KB)", flush=True)
+        return
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "audio")
         p = ytdlp(["-f", "bestaudio[acodec=opus]/bestaudio/best", "--quiet", "--no-part", "-o", out, url], timeout=180)
@@ -47,9 +68,26 @@ def do_download(job):
             raise RuntimeError((p.stderr or "yt-dlp failed").strip().splitlines()[-1][:300])
         with open(out, "rb") as f:
             data = f.read()
+        try: shutil.copyfile(out, kept)
+        except Exception as e: print(f"couldn't keep a copy on the Pi: {e}", flush=True)
     req("PUT", f"/fetch/jobs/{job['id']}?url={urllib.parse.quote(url, safe='')}", data=data,
         headers={"Content-Type": "application/octet-stream"}, timeout=180)
-    print(f"✓ downloaded {url} ({len(data)//1024} KB)", flush=True)
+    print(f"✓ downloaded {url} ({len(data)//1024} KB) and kept it", flush=True)
+
+def do_backup():
+    """Pull a consistent copy of the Aux database and keep BACKUP_DAYS days of them."""
+    try:
+        r = urllib.request.Request(SERVER + "/fetch/backup", headers={"Authorization": f"Bearer {KEY}", "User-Agent": f"aux-fetcher/{VERSION}"})
+        with urllib.request.urlopen(r, timeout=120) as resp:
+            dest = os.path.join(BACKUP_DIR, f"aux-{time.strftime('%Y-%m-%d')}.sqlite")
+            with open(dest + ".part", "wb") as f: shutil.copyfileobj(resp, f)
+            os.replace(dest + ".part", dest)
+        files = sorted(glob.glob(os.path.join(BACKUP_DIR, "aux-*.sqlite")))
+        for old in files[:-BACKUP_DAYS]: os.remove(old)
+        n, b = store_stats()
+        print(f"✓ database backed up to {dest} ({os.path.getsize(dest)//1024} KB) · Pi store: {n} songs, {b//1048576} MB", flush=True)
+    except Exception as e:
+        print(f"backup failed: {e}", flush=True)
 
 def do_search(job):
     q, n = job["query"], int(job.get("count") or 6)
@@ -86,12 +124,14 @@ def self_update():
     except Exception:
         pass
 
-print(f"Aux Fetcher {VERSION} → {SERVER} (host {HOST})", flush=True)
+n0, b0 = store_stats()
+print(f"Aux Fetcher {VERSION} → {SERVER} (host {HOST}) · store {STORE}: {n0} songs, {b0//1048576} MB", flush=True)
 last_update = time.time()
+last_backup = 0  # first backup right after boot, then daily
 backoff = 2
 while True:
     try:
-        job = req("GET", f"/fetch/jobs?wait=25&v={VERSION}&host={urllib.parse.quote(HOST)}", timeout=40)
+        job = req("GET", f"/fetch/jobs?wait=25&v={VERSION}&host={urllib.parse.quote(HOST)}&songs={store_stats()[0]}", timeout=40)
         backoff = 2
         if job and job.get("id"):
             try:
@@ -115,3 +155,5 @@ while True:
         time.sleep(backoff); backoff = min(backoff * 2, 60)
     if time.time() - last_update > 86400:
         self_update(); last_update = time.time()
+    if time.time() - last_backup > 86400:
+        last_backup = time.time(); do_backup()
