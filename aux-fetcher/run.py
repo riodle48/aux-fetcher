@@ -7,7 +7,7 @@ Outbound HTTPS only. Nothing listens. Nothing touches Home Assistant.
 """
 import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.parse, urllib.error, hashlib, shutil, glob, threading, re
 
-VERSION = "1.5.2"
+VERSION = "1.6.0"
 
 def load_options():
     opts = {}
@@ -326,6 +326,83 @@ def do_search(job):
         headers={"Content-Type": "application/json"})
     print(f"✓ search '{q}' → {len(rows)} results", flush=True)
 
+# ---- Lyric auto-sync: Whisper listens to the cached song, then we line the real (Genius) words up with when they were sung ----
+_whisper = {"model": None, "lock": threading.Lock()}
+WHISPER_MODEL = os.environ.get("AUX_WHISPER_MODEL") or "base"
+
+def _whisper_model():
+    try:
+        from faster_whisper import WhisperModel
+    except Exception:
+        raise Exception("Whisper isn't installed on this box (rebuild the add-on, or this CPU has no build of it)")
+    if _whisper["model"] is None:
+        root = os.path.join(STORE, "models")
+        os.makedirs(root, exist_ok=True)
+        _whisper["model"] = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", download_root=root, cpu_threads=3)
+    return _whisper["model"]
+
+def _norm_word(w):
+    return re.sub(r"[^\w']+", "", (w or "").lower().replace("\u2019", "'"))
+
+def align_lyrics(words, lines):
+    """words: [(normalised word, start seconds)] heard in the audio; lines: the real lyric lines. Returns a start time (or None) per line."""
+    import difflib
+    lw = []
+    for li, text in enumerate(lines):
+        for w in str(text).split():
+            n = _norm_word(w)
+            if n: lw.append((n, li))
+    a = [n for n, _ in lw]; b = [n for n, _ in words]
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    first = {}
+    for i, j, size in sm.get_matching_blocks():
+        if size == 0 or (size < 2 and len(a[i]) < 4): continue   # a lone short word ("the", "I") proves nothing
+        for k in range(size):
+            li = lw[i + k][1]
+            if li not in first: first[li] = words[j + k][1]
+    out = [None] * len(lines); last = -1.0
+    for li in sorted(first):
+        if first[li] >= last: out[li] = first[li]; last = first[li]   # times only ever go forward
+    return out
+
+def fill_times(out, dur):
+    idx = [i for i, t in enumerate(out) if t is not None]
+    if not idx: return out
+    for i in range(idx[0] - 1, -1, -1): out[i] = max(0.0, out[i + 1] - 3.0)
+    for i in range(idx[-1] + 1, len(out)): out[i] = min(dur or 1e9, out[i - 1] + 3.0)
+    for x, y in zip(idx, idx[1:]):
+        for i in range(x + 1, y): out[i] = out[x] + (out[y] - out[x]) * (i - x) / (y - x)
+    return out
+
+def do_align(job):
+    url = job["url"]; lines = [str(x) for x in (job.get("lines") or [])]
+    kept = cache_path(url)
+    if not os.path.exists(kept): raise Exception("that song isn't saved on the Pi yet")
+    if sum(1 for x in lines if x.strip()) < 4: raise Exception("not enough lyric lines to line up")
+    t0 = time.time()
+    with _whisper["lock"]:                      # one song at a time, it's heavy
+        try: os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10)   # be polite to Home Assistant
+        except Exception: pass
+        model = _whisper_model()
+        prompt = " ".join(x for x in lines if x.strip())[:400]
+        segs, info = model.transcribe(kept, word_timestamps=True, beam_size=1, vad_filter=False,
+                                      condition_on_previous_text=False, initial_prompt=prompt, language=job.get("language") or None)
+        words = []
+        for s in segs:
+            for w in (s.words or []):
+                n = _norm_word(w.word)
+                if n: words.append((n, float(w.start)))
+        dur = float(info.duration or 0)
+    if len(words) < 8: raise Exception("couldn't hear any words in that song")
+    got = align_lyrics(words, lines)
+    real = [i for i, x in enumerate(lines) if x.strip()]
+    hit = sum(1 for i in real if got[i] is not None)
+    cov = hit / max(1, len(real))
+    print(f"align {job.get('title') or url}: heard {len(words)} words, lined up {hit}/{len(real)} lines in {time.time() - t0:.0f}s", flush=True)
+    if cov < 0.35: raise Exception(f"only lined up {hit} of {len(real)} lines, not trusting it")
+    times = fill_times(got, dur)
+    post_result(job, {"times": [int(round(t * 1000)) for t in times], "coverage": round(cov, 2), "duration": round(dur, 1), "words": len(words), "language": info.language, "seconds": round(time.time() - t0)})
+
 def fail(job, msg):
     try:
         req("POST", f"/fetch/jobs/{job['id']}/fail", data=json.dumps({"error": msg}).encode(),
@@ -365,6 +442,8 @@ def run_job(job):
                 do_backups_list(job)
             elif job.get("kind") == "restore":
                 do_restore(job)
+            elif job.get("kind") == "align":
+                do_align(job)
             else:
                 fail(job, f"unknown job kind {job.get('kind')}")
         except Exception as e:
