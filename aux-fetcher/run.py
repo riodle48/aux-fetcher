@@ -7,7 +7,7 @@ Outbound HTTPS only. Nothing listens. Nothing touches Home Assistant.
 """
 import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.parse, urllib.error, hashlib, shutil, glob, threading, re
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 def load_options():
     opts = {}
@@ -374,6 +374,24 @@ def fill_times(out, dur):
         for i in range(x + 1, y): out[i] = out[x] + (out[y] - out[x]) * (i - x) / (y - x)
     return out
 
+def calibrate(ref_s, got):
+    """LRCLIB times (ref_s) vs when Whisper actually heard each line (got): fit got = a*ref + b, ignoring outliers.
+    Fixes a different intro (offset) and a sped-up / slowed version (scale). Returns (a, b, median error after the fit, anchors)."""
+    import statistics
+    pts = [(r, g) for r, g in zip(ref_s, got) if g is not None]
+    if len(pts) < 6: return None
+    a, b = 1.0, statistics.median(g - r for r, g in pts)
+    for _ in range(4):
+        keep = [(r, g) for r, g in pts if abs(g - (a * r + b)) < 2.5]
+        if len(keep) < 6: keep = pts
+        n = len(keep); mr = sum(r for r, _ in keep) / n; mg = sum(g for _, g in keep) / n
+        den = sum((r - mr) ** 2 for r, _ in keep)
+        if den < 1: break
+        a = sum((r - mr) * (g - mg) for r, g in keep) / den
+        a = min(1.3, max(0.77, a)); b = mg - a * mr
+    res = sorted(abs(g - (a * r + b)) for r, g in pts)
+    return a, b, res[len(res) // 2], len(pts)
+
 def do_align(job):
     url = job["url"]; lines = [str(x) for x in (job.get("lines") or [])]
     kept = cache_path(url)
@@ -400,8 +418,23 @@ def do_align(job):
     cov = hit / max(1, len(real))
     print(f"align {job.get('title') or url}: heard {len(words)} words, lined up {hit}/{len(real)} lines in {time.time() - t0:.0f}s", flush=True)
     if cov < 0.35: raise Exception(f"only lined up {hit} of {len(real)} lines, not trusting it")
-    times = fill_times(got, dur)
-    post_result(job, {"times": [int(round(t * 1000)) for t in times], "coverage": round(cov, 2), "duration": round(dur, 1), "words": len(words), "language": info.language, "seconds": round(time.time() - t0)})
+    scale, offset = 1.0, 0.0
+    ref = job.get("ref")
+    if ref and len(ref) == len(lines):
+        # These lyrics already have timing (LRCLIB). Check it against the real audio and correct it, keeping its line-by-line spacing.
+        ref_s = [float(x) / 1000.0 for x in ref]
+        cal = calibrate(ref_s, got)
+        if not cal or cal[2] > 2.0: raise Exception("couldn't confirm this song's timing against the audio")
+        scale, offset = cal[0], cal[1]
+        times = []
+        for i, r in enumerate(ref_s):
+            fit = scale * r + offset; g = got[i]
+            times.append(g if (g is not None and 0.7 < abs(g - fit) <= 4.0) else fit)   # a clear local disagreement follows the audio; otherwise the smooth fit
+        times = [max(0.0, t) for t in times]
+        for i in range(1, len(times)): times[i] = max(times[i], times[i - 1])
+    else:
+        times = fill_times(got, dur)
+    post_result(job, {"times": [int(round(t * 1000)) for t in times], "coverage": round(cov, 2), "scale": round(scale, 3), "offset": round(offset, 2), "duration": round(dur, 1), "words": len(words), "language": info.language, "seconds": round(time.time() - t0)})
 
 def fail(job, msg):
     try:
