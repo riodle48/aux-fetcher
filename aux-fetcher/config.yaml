@@ -1,5 +1,5 @@
 name: Aux Fetcher
-version: "1.5.2"
+version: "1.6.0"
 slug: aux_fetcher
 description: Downloads songs for your Aux Discord bot through your home internet, keeps a copy of every song on this box, and backs up the Aux database nightly. Outbound only, no open ports.
 url: https://github.com/riodle48/aux-fetcher
