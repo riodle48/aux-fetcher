@@ -7,7 +7,7 @@ Outbound HTTPS only. Nothing listens. Nothing touches Home Assistant.
 """
 import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.parse, urllib.error, hashlib, shutil, glob, threading, re, unicodedata
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 
 def load_options():
     opts = {}
@@ -387,13 +387,48 @@ def align_lyrics(words, lines):
         if first[li] >= last: out[li] = first[li]; last = first[li]   # times only ever go forward
     return out
 
-def fill_times(out, dur):
+def _line_weight(s):
+    """Roughly how long a line takes to sing. A six-word line is not the same as "dime"."""
+    return max(4, len(re.sub(r"[^\w]", "", str(s))))
+
+def fill_times(out, dur, lines=None, heard_from=None, heard_to=None):
+    """Lines Whisper anchored keep their real time. The rest are spread between the anchors in
+    proportion to how much text each line carries -- an even spread is what makes the words drift
+    off the beat between anchors. Lines before the first anchor start no earlier than the first
+    word actually heard, which is what stopped them appearing during the intro."""
+    n = len(out)
     idx = [i for i, t in enumerate(out) if t is not None]
     if not idx: return out
-    for i in range(idx[0] - 1, -1, -1): out[i] = max(0.0, out[i + 1] - 3.0)
-    for i in range(idx[-1] + 1, len(out)): out[i] = min(dur or 1e9, out[i - 1] + 3.0)
+    wt = [_line_weight(lines[i]) if lines else 1 for i in range(n)]
+
+    first = idx[0]
+    if first > 0:
+        lo = heard_from if heard_from is not None else max(0.0, out[first] - 3.0 * first)
+        lo = max(0.0, min(lo, out[first] - 0.5))
+        total = sum(wt[0:first]) or 1
+        acc = 0.0
+        for i in range(0, first):
+            out[i] = lo + (out[first] - lo) * (acc / total); acc += wt[i]
+
     for x, y in zip(idx, idx[1:]):
-        for i in range(x + 1, y): out[i] = out[x] + (out[y] - out[x]) * (i - x) / (y - x)
+        if y > x + 1:
+            total = sum(wt[x:y]) or 1
+            acc = float(wt[x])
+            for i in range(x + 1, y):
+                out[i] = out[x] + (out[y] - out[x]) * (acc / total); acc += wt[i]
+
+    last = idx[-1]
+    if last < n - 1:
+        hi = heard_to if heard_to is not None else (dur or out[last] + 3.0 * (n - last))
+        hi = max(hi, out[last] + 1.0)
+        if dur: hi = min(hi, dur)
+        total = sum(wt[last:n]) or 1
+        acc = float(wt[last])
+        for i in range(last + 1, n):
+            out[i] = out[last] + (hi - out[last]) * (acc / total); acc += wt[i]
+
+    for i in range(1, n):
+        if out[i] < out[i - 1]: out[i] = out[i - 1]
     return out
 
 def calibrate(ref_s, got):
@@ -458,7 +493,7 @@ def do_align(job):
         times = [max(0.0, t) for t in times]
         for i in range(1, len(times)): times[i] = max(times[i], times[i - 1])
     else:
-        times = fill_times(got, dur)
+        times = fill_times(got, dur, lines, words[0][1], words[-1][1])
     post_result(job, {"times": [int(round(t * 1000)) for t in times], "coverage": round(cov, 2), "scale": round(scale, 3), "offset": round(offset, 2), "duration": round(dur, 1), "words": len(words), "language": info.language, "seconds": round(time.time() - t0)})
 
 def fail(job, msg):
