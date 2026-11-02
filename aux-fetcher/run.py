@@ -5,9 +5,9 @@ It asks the Aux server for jobs ("download this YouTube page" / "search for this
 from your residential IP (YouTube doesn't bot-check those), and posts the result back.
 Outbound HTTPS only. Nothing listens. Nothing touches Home Assistant.
 """
-import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.parse, urllib.error, hashlib, shutil, glob, threading, re
+import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.parse, urllib.error, hashlib, shutil, glob, threading, re, unicodedata
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 
 def load_options():
     opts = {}
@@ -342,7 +342,29 @@ def _whisper_model():
     return _whisper["model"]
 
 def _norm_word(w):
-    return re.sub(r"[^\w']+", "", (w or "").lower().replace("\u2019", "'"))
+    # Accent-blind: Whisper writes "corazon" about as often as "corazon" with the accent, and the lyric sheet picks one.
+    w = (w or "").lower().replace("\u2019", "'")
+    w = "".join(c for c in unicodedata.normalize("NFD", w) if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^\w']+", "", w)
+
+# Whisper guessing the language of a song it can barely hear is where this broke: a Spanish cumbia came back as
+# 135 English-ish words and matched 0 of 34 lines. We already hold the real words, so the lyric sheet decides.
+_LANG = {
+    "es": set("que de la el los las un una por con para pero como mas mi tu te se yo ya cuando porque amor corazon vida noche quiero nada soy eres sin nunca siempre dime".split()),
+    "en": set("the you and that with for but your this what all just like dont cant never gonna baby love know time got from about".split()),
+    "pt": set("voce nao uma com para mas meu minha coracao saudade tudo entao quero vida noite sempre agora ainda".split()),
+    "it": set("che non una per con ma mio mia cuore amore sempre piu quando cosa questo sono anche".split()),
+    "fr": set("je tu le la les pas pour avec mais mon ma tout amour coeur quand toi comme etre".split()),
+}
+
+def guess_language(lines):
+    """Which language is this lyric sheet in? None when it is not clear (then Whisper may detect it itself)."""
+    words = [w for ln in lines for w in (_norm_word(x) for x in str(ln).split()) if w]
+    if len(words) < 12: return None
+    score = {k: sum(1 for w in words if w in s) / len(words) for k, s in _LANG.items()}
+    best = max(score, key=score.get)
+    rest = max([v for k, v in score.items() if k != best] or [0])
+    return None if (score[best] < 0.07 or score[best] < 1.3 * rest) else best
 
 def align_lyrics(words, lines):
     """words: [(normalised word, start seconds)] heard in the audio; lines: the real lyric lines. Returns a start time (or None) per line."""
@@ -403,8 +425,9 @@ def do_align(job):
         except Exception: pass
         model = _whisper_model()
         prompt = " ".join(x for x in lines if x.strip())[:400]
+        lang = job.get("language") or guess_language(lines)
         segs, info = model.transcribe(kept, word_timestamps=True, beam_size=1, vad_filter=False,
-                                      condition_on_previous_text=False, initial_prompt=prompt, language=job.get("language") or None)
+                                      condition_on_previous_text=False, initial_prompt=prompt, language=lang or None)
         words = []
         for s in segs:
             for w in (s.words or []):
@@ -416,8 +439,10 @@ def do_align(job):
     real = [i for i, x in enumerate(lines) if x.strip()]
     hit = sum(1 for i in real if got[i] is not None)
     cov = hit / max(1, len(real))
-    print(f"align {job.get('title') or url}: heard {len(words)} words, lined up {hit}/{len(real)} lines in {time.time() - t0:.0f}s", flush=True)
-    if cov < 0.35: raise Exception(f"only lined up {hit} of {len(real)} lines, not trusting it")
+    print(f"align {job.get('title') or url}: heard {len(words)} words in {info.language or '?'} (asked for {lang or 'auto'}), lined up {hit}/{len(real)} lines in {time.time() - t0:.0f}s", flush=True)
+    # Anchored lines get their real time and the rest interpolate between them, so a fifth of a long song is plenty
+    # -- but a handful of hits on a short one is noise, hence the floor.
+    if cov < 0.20 or hit < 6: raise Exception(f"only lined up {hit} of {len(real)} lines, not trusting it")
     scale, offset = 1.0, 0.0
     ref = job.get("ref")
     if ref and len(ref) == len(lines):
